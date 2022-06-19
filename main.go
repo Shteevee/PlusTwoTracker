@@ -14,7 +14,8 @@ import (
 )
 
 const (
-	streamer string = "Northernlion"
+	streamer   string        = "Northernlion"
+	windowSize time.Duration = 10
 )
 
 type StatTracker struct {
@@ -55,7 +56,7 @@ func handleMessageWindow(f *os.File, plusTwos chan int, minusTwos chan int) {
 			minusTwoTracker.incrementCount()
 		}
 	}()
-	for range time.Tick(time.Second * 10) {
+	for range time.Tick(time.Second * windowSize) {
 		plusTwoTracker.mu.Lock()
 		minusTwoTracker.mu.Lock()
 		writeCounts(f, plusTwoTracker.count, minusTwoTracker.count)
