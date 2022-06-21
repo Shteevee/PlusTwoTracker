@@ -19,8 +19,9 @@ const (
 )
 
 type StatTracker struct {
-	mu    sync.Mutex
-	count uint32
+	mu             sync.Mutex
+	count          uint32
+	messageMatches chan int
 }
 
 func (st *StatTracker) incrementCount() {
@@ -29,6 +30,23 @@ func (st *StatTracker) incrementCount() {
 	st.mu.Unlock()
 }
 
+func lockStatTrackers(statTrackers []*StatTracker) {
+	for _, st := range statTrackers {
+		st.mu.Lock()
+	}
+}
+
+func unlockStatTrackers(statTrackers []*StatTracker) {
+	for _, st := range statTrackers {
+		st.mu.Unlock()
+	}
+}
+
+func resetStatTrackers(statTrackers []*StatTracker) {
+	for _, st := range statTrackers {
+		st.count = 0
+	}
+}
 func handleInterrupt(c chan os.Signal, f *os.File) {
 	<-c
 	fmt.Println("Closing...")
@@ -36,7 +54,7 @@ func handleInterrupt(c chan os.Signal, f *os.File) {
 	os.Exit(0)
 }
 
-func writeCounts(f *os.File, plus2Count uint32, minus2Count uint32) {
+func writeStats(f *os.File, plus2Count uint32, minus2Count uint32) {
 	line := fmt.Sprintf("%d,%d,%d\n", time.Now().Unix(), plus2Count, minus2Count)
 	if _, err := f.Write([]byte(line)); err != nil {
 		log.Fatal(err)
@@ -44,26 +62,23 @@ func writeCounts(f *os.File, plus2Count uint32, minus2Count uint32) {
 }
 
 func handleMessageWindow(f *os.File, plusTwos chan int, minusTwos chan int) {
-	plusTwoTracker := StatTracker{mu: sync.Mutex{}, count: 0}
-	minusTwoTracker := StatTracker{mu: sync.Mutex{}, count: 0}
-	go func() {
-		for range plusTwos {
-			plusTwoTracker.incrementCount()
-		}
-	}()
-	go func() {
-		for range minusTwos {
-			minusTwoTracker.incrementCount()
-		}
-	}()
+	plusTwoTracker := StatTracker{mu: sync.Mutex{}, count: 0, messageMatches: plusTwos}
+	minusTwoTracker := StatTracker{mu: sync.Mutex{}, count: 0, messageMatches: minusTwos}
+	statTrackers := []*StatTracker{&plusTwoTracker, &minusTwoTracker}
+
+	for _, st := range statTrackers {
+		go func(st *StatTracker) {
+			for range st.messageMatches {
+				st.incrementCount()
+			}
+		}(st)
+	}
+
 	for range time.Tick(time.Second * windowSize) {
-		plusTwoTracker.mu.Lock()
-		minusTwoTracker.mu.Lock()
-		writeCounts(f, plusTwoTracker.count, minusTwoTracker.count)
-		plusTwoTracker.count = 0
-		minusTwoTracker.count = 0
-		plusTwoTracker.mu.Unlock()
-		minusTwoTracker.mu.Unlock()
+		lockStatTrackers(statTrackers)
+		writeStats(f, plusTwoTracker.count, minusTwoTracker.count)
+		resetStatTrackers(statTrackers)
+		unlockStatTrackers(statTrackers)
 	}
 }
 
@@ -72,7 +87,8 @@ func createTwitchClient(plusTwos chan int, minusTwos chan int) *twitch.Client {
 	client.OnPrivateMessage(func(message twitch.PrivateMessage) {
 		if strings.Contains(message.Message, "+2") {
 			plusTwos <- 1
-		} else if strings.Contains(message.Message, "-2") {
+		}
+		if strings.Contains(message.Message, "-2") {
 			minusTwos <- 1
 		}
 	})
