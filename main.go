@@ -1,16 +1,21 @@
 package main
 
 import (
+	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/gempir/go-twitch-irc/v3"
+	"github.com/gorilla/websocket"
 )
 
 const (
@@ -18,78 +23,94 @@ const (
 	windowSize time.Duration = 10
 )
 
-type StatTracker struct {
-	mu             sync.Mutex
-	count          uint32
-	messageMatches chan int
+var addr = flag.String("addr", "localhost:8080", "http service address")
+
+var upgrader = websocket.Upgrader{}
+
+type StatWindow struct {
+	Time      int64
+	PlusTwos  uint32
+	MinusTwos uint32
 }
 
-func (st *StatTracker) incrementCount() {
-	st.mu.Lock()
-	st.count++
-	st.mu.Unlock()
-}
-
-func lockStatTrackers(statTrackers []*StatTracker) {
-	for _, st := range statTrackers {
-		st.mu.Lock()
+func findConnIndex(connStats []chan StatWindow, conn chan StatWindow) int {
+	for i, c := range connStats {
+		if c == conn {
+			return i
+		}
 	}
+	return -1
 }
 
-func unlockStatTrackers(statTrackers []*StatTracker) {
-	for _, st := range statTrackers {
-		st.mu.Unlock()
-	}
+func getStat(stat *uint32) uint32 {
+	return atomic.LoadUint32(stat)
 }
 
-func resetStatTrackers(statTrackers []*StatTracker) {
-	for _, st := range statTrackers {
-		st.count = 0
-	}
+func resetStat(stat *uint32) {
+	atomic.StoreUint32(stat, 0)
 }
-func handleInterrupt(c chan os.Signal, f *os.File) {
+
+func incrementStat(stat *uint32) {
+	atomic.AddUint32(stat, 1)
+}
+
+func handleInterrupt(c chan os.Signal) {
 	<-c
 	fmt.Println("Closing...")
-	f.Close()
 	os.Exit(0)
 }
 
-func writeStats(f *os.File, plus2Count uint32, minus2Count uint32) {
-	line := fmt.Sprintf("%d,%d,%d\n", time.Now().Unix(), plus2Count, minus2Count)
-	if _, err := f.Write([]byte(line)); err != nil {
-		log.Fatal(err)
-	}
-}
-
-func handleMessageWindow(f *os.File, plusTwos chan int, minusTwos chan int) {
-	plusTwoTracker := StatTracker{mu: sync.Mutex{}, count: 0, messageMatches: plusTwos}
-	minusTwoTracker := StatTracker{mu: sync.Mutex{}, count: 0, messageMatches: minusTwos}
-	statTrackers := []*StatTracker{&plusTwoTracker, &minusTwoTracker}
-
-	for _, st := range statTrackers {
-		go func(st *StatTracker) {
-			for range st.messageMatches {
-				st.incrementCount()
-			}
-		}(st)
-	}
-
+func pushStatsWindow(
+	connStats *[]chan StatWindow,
+	plusTwos *uint32,
+	minusTwos *uint32,
+) {
 	for range time.Tick(time.Second * windowSize) {
-		lockStatTrackers(statTrackers)
-		writeStats(f, plusTwoTracker.count, minusTwoTracker.count)
-		resetStatTrackers(statTrackers)
-		unlockStatTrackers(statTrackers)
+		statWindow := StatWindow{
+			Time:      time.Now().Unix(),
+			PlusTwos:  getStat(plusTwos),
+			MinusTwos: getStat(minusTwos),
+		}
+		log.Println(statWindow)
+		for _, stats := range *connStats {
+			stats <- statWindow
+		}
+		resetStat(plusTwos)
+		resetStat(minusTwos)
 	}
 }
 
-func createTwitchClient(plusTwos chan int, minusTwos chan int) *twitch.Client {
+func handleWebsocket(
+	w http.ResponseWriter,
+	r *http.Request,
+	statWindows chan StatWindow,
+) {
+	upgrader.CheckOrigin = func(r *http.Request) bool { return true }
+	c, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Print("upgrade:", err)
+		return
+	}
+	defer c.Close()
+
+	for statWindow := range statWindows {
+		json, _ := json.Marshal(statWindow)
+		err := c.WriteMessage(websocket.TextMessage, json)
+		if err != nil {
+			log.Println("write:", err)
+			break
+		}
+	}
+}
+
+func createTwitchClient(plusTwos *uint32, minusTwos *uint32) *twitch.Client {
 	client := twitch.NewAnonymousClient()
 	client.OnPrivateMessage(func(message twitch.PrivateMessage) {
 		if strings.Contains(message.Message, "+2") {
-			plusTwos <- 1
+			incrementStat(plusTwos)
 		}
 		if strings.Contains(message.Message, "-2") {
-			minusTwos <- 1
+			incrementStat(minusTwos)
 		}
 	})
 	client.OnConnect(func() {
@@ -104,17 +125,36 @@ func main() {
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 
-	f, fileErr := os.OpenFile("plus2.csv", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if fileErr != nil {
-		log.Fatal(fileErr)
-	}
-	go handleInterrupt(c, f)
+	go handleInterrupt(c)
 
-	plusTwos := make(chan int)
-	minusTwos := make(chan int)
-	go handleMessageWindow(f, plusTwos, minusTwos)
+	var plusTwos uint32 = 0
+	var minusTwos uint32 = 0
+	connStats := make([]chan StatWindow, 0)
+	connStatsLock := sync.Mutex{}
 
-	client := createTwitchClient(plusTwos, minusTwos)
+	http.HandleFunc(
+		"/tracker",
+		func(w http.ResponseWriter, r *http.Request) {
+			statWindows := make(chan StatWindow)
+			connStatsLock.Lock()
+			connStats = append(connStats, statWindows)
+			connStatsLock.Unlock()
+			defer func() {
+				connStatsLock.Lock()
+				i := findConnIndex(connStats, statWindows)
+				if i != -1 {
+					connStats = connStats[:i+copy(connStats[i:], connStats[i+1:])]
+				}
+				connStatsLock.Unlock()
+			}()
+			handleWebsocket(w, r, statWindows)
+		},
+	)
+
+	go http.ListenAndServe(*addr, nil)
+	go pushStatsWindow(&connStats, &plusTwos, &minusTwos)
+
+	client := createTwitchClient(&plusTwos, &minusTwos)
 	clientErr := client.Connect()
 	if clientErr != nil {
 		panic(clientErr)
